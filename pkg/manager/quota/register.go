@@ -17,35 +17,65 @@ limitations under the License.
 package quota
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"time"
 
+	"github.com/kiosk-sh/kiosk/pkg/manager/controllers"
 	quotacontroller "github.com/kiosk-sh/kiosk/pkg/manager/quota/controller"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"github.com/kiosk-sh/kiosk/kube/pkg/quota/v1/generic"
+	kubectrlmgrconfigv1alpha1 "k8s.io/kube-controller-manager/config/v1alpha1"
 )
 
+// RecommendedDefaultResourceQuotaControllerConfiguration defaults a pointer to a
+// ResourceQuotaControllerConfiguration struct. This will set the recommended default
+// values, but they may be subject to change between API versions. This function
+// is intentionally not registered in the scheme as a "normal" `SetDefaults_Foo`
+// function to allow consumers of this type to set whatever defaults for their
+// embedded configs. Forcing consumers to use these defaults would be problematic
+// as defaulting in the scheme is done as part of the conversion, and there would
+// be no easy way to opt-out. Instead, if you want to use this defaulting method
+// run it in your wrapper struct of this type in its `SetDefaults_` method.
+func RecommendedDefaultResourceQuotaControllerConfiguration(obj *kubectrlmgrconfigv1alpha1.ResourceQuotaControllerConfiguration) {
+	zero := metav1.Duration{}
+	if obj.ConcurrentResourceQuotaSyncs == 0 {
+		obj.ConcurrentResourceQuotaSyncs = 5
+	}
+	if obj.ResourceQuotaSyncPeriod == zero {
+		obj.ResourceQuotaSyncPeriod = metav1.Duration{Duration: 5 * time.Minute}
+	}
+}
+
 // Register registers the quota controller
-func Register(mgr manager.Manager) error {
-	quotaConfiguration := NewQuotaConfiguration(mgr)
+func Register(ctrlCtx *controllers.Context) error {
+	controllerConfig := &kubectrlmgrconfigv1alpha1.ResourceQuotaControllerConfiguration{}
+	RecommendedDefaultResourceQuotaControllerConfiguration(controllerConfig)
+
+	listerFuncForResource := generic.ListerFuncForResourceFunc(ctrlCtx.SharedInformers.ForResource)
+	quotaConfiguration := NewQuotaConfiguration(listerFuncForResource)
+
 	ctrlOptions := &quotacontroller.AccountQuotaControllerOptions{
-		Manager:                   mgr,
-		ResyncPeriod:              func() time.Duration { return time.Hour * 10 },
-		Registry:                  NewQuotaRegistry(quotaConfiguration),
-		IgnoredResourcesFunc:      func() map[schema.GroupResource]struct{} { return quotaConfiguration.IgnoredResources() },
-		ReplenishmentResyncPeriod: func() time.Duration { return time.Hour * 10 },
+		Manager:                   ctrlCtx.Manager,
+		ResyncPeriod:              quotacontroller.StaticResyncPeriodFunc(controllerConfig.ResourceQuotaSyncPeriod.Duration),
+		InformerFactory:           ctrlCtx.ObjectOrMetadataInformers,
+		ReplenishmentResyncPeriod: controllers.ResyncPeriod(),
+		DiscoveryFunc:             ctrlCtx.DiscoveryFunc,
+		IgnoredResourcesFunc:      quotaConfiguration.IgnoredResources,
+		InformersStarted:          ctrlCtx.InformersStarted,
+		Registry:                  generic.NewRegistry(quotaConfiguration.Evaluators()),
 	}
 
+	// Create the controller from options
 	controller, err := quotacontroller.NewAccountQuotaController(ctrlOptions)
 	if err != nil {
 		return err
 	}
 
 	// Start the controller
-	go func() {
-		mgr.GetCache().WaitForCacheSync(nil)
-		controller.Run(10, make(chan struct{}))
-	}()
+	go controller.Run(int(controllerConfig.ConcurrentResourceQuotaSyncs), ctrlCtx.StopChan)
+
+	// Periodically the quota controller to detect new resource types
+	go controller.Sync(ctrlCtx.DiscoveryFunc, 30*time.Second, ctrlCtx.StopChan)
 
 	return nil
 }

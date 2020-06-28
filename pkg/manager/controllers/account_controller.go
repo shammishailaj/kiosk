@@ -18,17 +18,21 @@ package controllers
 
 import (
 	"context"
-
-	configv1alpha1 "github.com/kiosk-sh/kiosk/pkg/apis/config/v1alpha1"
-	"github.com/kiosk-sh/kiosk/pkg/apiserver/registry/util"
-	"github.com/kiosk-sh/kiosk/pkg/constants"
-	"github.com/kiosk-sh/kiosk/pkg/manager/events"
-	namespaceutils "github.com/kiosk-sh/kiosk/pkg/util"
+	tenancyv1alpha1 "github.com/kiosk-sh/kiosk/pkg/apis/tenancy/v1alpha1"
+	"github.com/kiosk-sh/kiosk/pkg/util"
+	"github.com/kiosk-sh/kiosk/pkg/util/clienthelper"
+	"github.com/kiosk-sh/kiosk/pkg/util/clusterrole"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/go-logr/logr"
+	configv1alpha1 "github.com/kiosk-sh/kiosk/pkg/apis/config/v1alpha1"
+	"github.com/kiosk-sh/kiosk/pkg/constants"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -44,12 +48,6 @@ type AccountReconciler struct {
 	Log    logr.Logger
 	Scheme *runtime.Scheme
 }
-
-// +kubebuilder:rbac:groups=config.kiosk.sh,resources=accounts,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=config.kiosk.sh,resources=accounts/status,verbs=get;update;patch
-
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;create;update;patch
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;create;update;patch
 
 // Reconcile reads that state of the cluster for an Account object and makes changes based on the state read
 func (r *AccountReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
@@ -75,8 +73,14 @@ func (r *AccountReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		return ctrl.Result{}, err
 	}
 
-	// Ensure our rolebindings are still correct
-	err = r.ensureRoleBindings(ctx, account, namespaceList.Items, log)
+	// Ensure our role bindings have the correct subjects
+	err = r.syncRoleBindings(ctx, account, log)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Ensure our clusterroles are still correct
+	err = r.syncClusterRoles(ctx, account, log)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -102,128 +106,199 @@ func (r *AccountReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	return ctrl.Result{}, nil
 }
 
-func (r *AccountReconciler) ensureRoleBindings(ctx context.Context, account *configv1alpha1.Account, namespaces []corev1.Namespace, log logr.Logger) error {
-	// List owned role bindings
-	roleBindingList := &rbacv1.RoleBindingList{}
-	err := r.List(ctx, roleBindingList, client.MatchingFields{constants.IndexByAccount: account.Name})
+func (r *AccountReconciler) syncRoleBindings(ctx context.Context, account *configv1alpha1.Account, log logr.Logger) error {
+	roleBindings := &rbacv1.RoleBindingList{}
+	err := r.List(ctx, roleBindings, client.MatchingFields{constants.IndexByAccount: account.Name})
 	if err != nil {
 		return err
 	}
 
-	// Delete all owned role bindings
-	clusterRole := util.GetClusterRoleFor(account)
-	if clusterRole == "" || len(account.Spec.Subjects) == 0 {
-		for _, rb := range roleBindingList.Items {
-			err = r.Delete(ctx, &rb)
+	for _, crb := range roleBindings.Items {
+		// Update role binding
+		if apiequality.Semantic.DeepEqual(crb.Subjects, account.Spec.Subjects) == false {
+			crb.Subjects = account.Spec.Subjects
+			err := r.Update(ctx, &crb)
 			if err != nil {
 				return err
 			}
-		}
 
-		return nil
-	}
-
-	// Things to check for
-	// 1. Remove multiple owned rolebindings per namespace
-	// 2. Remove role bindings from namespaces not owned by the account anymore
-	// 3. Update Subjects of RoleBindings if necessary
-	// 4. Check if all namespaces have RoleBindings
-	createRoleBindings := map[string]bool{}
-	deleteRoleBindings := map[string]rbacv1.RoleBinding{}
-
-	// Update role bindings
-	expectedRoleRef := rbacv1.RoleRef{
-		APIGroup: rbacv1.SchemeGroupVersion.Group,
-		Kind:     "ClusterRole",
-		Name:     clusterRole,
-	}
-
-	// Check which role bindings to update
-	for _, rb := range roleBindingList.Items {
-		if apiequality.Semantic.DeepEqual(&rb.Subjects, &account.Spec.Subjects) == false || apiequality.Semantic.DeepEqual(&rb.RoleRef, &expectedRoleRef) == false {
-			createRoleBindings[rb.Namespace] = true
-			deleteRoleBindings[rb.Namespace+"/"+rb.Name] = rb
-		}
-	}
-
-	// Delete duplicate role bindings in namespace & check if there are namespaces without rolebindings
-	for _, n := range namespaces {
-		found := false
-		for _, rb := range roleBindingList.Items {
-			if n.Name == rb.Namespace {
-				if _, ok := createRoleBindings[rb.Namespace]; ok {
-					deleteRoleBindings[rb.Namespace+"/"+rb.Name] = rb
-					found = true
-					continue
-				}
-
-				if found == true {
-					deleteRoleBindings[rb.Namespace+"/"+rb.Name] = rb
-				}
-
-				found = true
-			}
-		}
-
-		if !found && n.Status.Phase == corev1.NamespaceActive && !namespaceutils.IsNamespaceInitializing(&n) {
-			createRoleBindings[n.Name] = true
-		}
-	}
-
-	// Delete role bindings from namespaces that don't belong to the account anymore
-	for _, rb := range roleBindingList.Items {
-		if _, ok := deleteRoleBindings[rb.Namespace+"/"+rb.Name]; ok {
-			continue
-		}
-
-		// We delete the role binding if we will create another in the namespace
-		if _, ok := createRoleBindings[rb.Namespace]; ok {
-			deleteRoleBindings[rb.Namespace+"/"+rb.Name] = rb
-			continue
-		}
-
-		found := false
-		for _, n := range namespaces {
-			if n.Name == rb.Namespace {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			deleteRoleBindings[rb.Namespace+"/"+rb.Name] = rb
-		}
-	}
-
-	// Create all new role bindings before we delete the old
-	for namespace := range createRoleBindings {
-		// We have to create the rolebinding first and then delete the old one
-		err = util.CreateRoleBinding(ctx, r, namespace, account, r.Scheme)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Delete the rolebindings that are not needed anymore
-	for _, rb := range deleteRoleBindings {
-		err = r.Delete(ctx, &rb)
-		if err != nil {
-			if kerrors.IsNotFound(err) {
-				continue
-			}
-
-			return err
+			log.V(1).Info("updated role binding " + crb.Namespace + "/" + crb.Name)
 		}
 	}
 
 	return nil
 }
 
+func (r *AccountReconciler) syncClusterRoles(ctx context.Context, account *configv1alpha1.Account, log logr.Logger) error {
+	// Ensure cluster role
+	clusterRoleList := &rbacv1.ClusterRoleList{}
+	err := r.List(ctx, clusterRoleList, client.MatchingFields{constants.IndexByAccount: account.Name})
+	if err != nil {
+		return err
+	}
+
+	newRules := r.getClusterRoleRules(account)
+	clusterRoles, err := clusterrole.SyncClusterRoles(ctx, r.Client, clusterRoleList.Items, newRules, true)
+	if err != nil {
+		return err
+	} else if len(clusterRoles) == 0 {
+		// Create new cluster role
+		clusterRole := &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: RBACGenerateName(account),
+			},
+			Rules: newRules,
+		}
+
+		err = clienthelper.CreateWithOwner(ctx, r.Client, clusterRole, account, r.Scheme)
+		if err != nil {
+			return err
+		}
+
+		log.Info("Created cluster role " + clusterRole.Name)
+		clusterRoles = []rbacv1.ClusterRole{*clusterRole}
+	}
+
+	// Get relevant cluster role bindings
+	clusterRoleBindingsList := &rbacv1.ClusterRoleBindingList{}
+	err = r.List(ctx, clusterRoleBindingsList, client.MatchingFields{constants.IndexByAccount: account.Name})
+	if err != nil {
+		return err
+	}
+
+	// sync cluster role bindings
+	// tasks:
+	// - make sure all cluster role bindings we own have the correct subjects
+	// - make sure there is at least one cluster role binding for the cluster role ensured above
+	found := false
+	for _, crb := range clusterRoleBindingsList.Items {
+		if crb.RoleRef.Name == clusterRoles[0].Name {
+			found = true
+		}
+
+		// Update cluster role binding if subjects differ
+		if apiequality.Semantic.DeepEqual(crb.Subjects, account.Spec.Subjects) == false {
+			crb.Subjects = account.Spec.Subjects
+			err := r.Client.Update(ctx, &crb)
+			if err != nil {
+				return err
+			}
+
+			log.Info("Updated cluster role binding " + crb.Name)
+		}
+	}
+
+	// if no cluster role binding was found for the above role, then create one
+	if !found {
+		clusterRoleBinding := &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: RBACGenerateName(account),
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: rbacv1.GroupName,
+				Kind:     "ClusterRole",
+				Name:     clusterRoles[0].Name,
+			},
+			Subjects: account.Spec.Subjects,
+		}
+
+		err = clienthelper.CreateWithOwner(ctx, r.Client, clusterRoleBinding, account, r.Scheme)
+		if err != nil {
+			return err
+		}
+
+		log.Info("Created cluster role binding " + clusterRoleBinding.Name)
+	}
+
+	return nil
+}
+
+func (r *AccountReconciler) getClusterRoleRules(account *configv1alpha1.Account) []rbacv1.PolicyRule {
+	rules := []rbacv1.PolicyRule{
+		{
+			Verbs:     []string{"list"},
+			APIGroups: []string{tenancyv1alpha1.SchemeGroupVersion.Group},
+			Resources: []string{"accounts", "spaces"},
+		},
+		{
+			Verbs:     []string{"get"},
+			APIGroups: []string{tenancyv1alpha1.SchemeGroupVersion.Group},
+			Resources: []string{"spaces"},
+		},
+		{
+			Verbs:         []string{"get"},
+			APIGroups:     []string{tenancyv1alpha1.SchemeGroupVersion.Group},
+			Resources:     []string{"accounts"},
+			ResourceNames: []string{account.Name},
+		},
+	}
+
+	return rules
+}
+
+// NamespaceEventHandler handles events
+type NamespaceEventHandler struct {
+	Log logr.Logger
+}
+
+// Create implements EventHandler
+func (e *NamespaceEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimitingInterface) {
+	e.handleEvent(evt.Meta, q)
+}
+
+// Update implements EventHandler
+func (e *NamespaceEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
+	if util.GetAccountFromNamespace(evt.MetaOld) == util.GetAccountFromNamespace(evt.MetaNew) {
+		return
+	}
+
+	e.handleEvent(evt.MetaOld, q)
+	e.handleEvent(evt.MetaNew, q)
+}
+
+// Delete implements EventHandler
+func (e *NamespaceEventHandler) Delete(evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
+	e.handleEvent(evt.Meta, q)
+}
+
+// Generic implements EventHandler
+func (e *NamespaceEventHandler) Generic(evt event.GenericEvent, q workqueue.RateLimitingInterface) {
+	e.handleEvent(evt.Meta, q)
+}
+
+func (e *NamespaceEventHandler) handleEvent(meta metav1.Object, q workqueue.RateLimitingInterface) {
+	if meta == nil {
+		return
+	}
+
+	labels := meta.GetLabels()
+	if labels == nil {
+		return
+	}
+
+	if owner, ok := labels[constants.SpaceLabelAccount]; ok && owner != "" {
+		q.Add(reconcile.Request{NamespacedName: types.NamespacedName{
+			Name: owner,
+		}})
+	}
+}
+
 // SetupWithManager adds the controller to the manager
 func (r *AccountReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		Watches(&source.Kind{Type: &corev1.Namespace{}}, &events.NamespaceEventHandler{}).
+		Watches(&source.Kind{Type: &corev1.Namespace{}}, &NamespaceEventHandler{}).
+		Owns(&rbacv1.ClusterRoleBinding{}).
+		Owns(&rbacv1.ClusterRole{}).
 		Owns(&rbacv1.RoleBinding{}).
 		For(&configv1alpha1.Account{}).
 		Complete(r)
+}
+
+func RBACGenerateName(account *configv1alpha1.Account) string {
+	name := account.Name
+	if len(name) > 42 {
+		name = name[:42]
+	}
+
+	return "kiosk-account-" + name + "-"
 }

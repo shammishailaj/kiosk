@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	configv1alpha1 "github.com/kiosk-sh/kiosk/pkg/apis/config/v1alpha1"
-	"github.com/kiosk-sh/kiosk/pkg/apis/tenancy"
 	"github.com/kiosk-sh/kiosk/pkg/constants"
 	"github.com/kiosk-sh/kiosk/pkg/util"
 	testingutil "github.com/kiosk-sh/kiosk/pkg/util/testing"
@@ -58,8 +57,8 @@ func TestAddManagerIndices(t *testing.T) {
 			key:  constants.IndexByAccount,
 			in: &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{
-						tenancy.SpaceAnnotationAccount: "myAccount2",
+					Labels: map[string]string{
+						constants.SpaceLabelAccount: "myAccount2",
 					},
 				},
 			},
@@ -92,6 +91,17 @@ func TestAddManagerIndices(t *testing.T) {
 				},
 			},
 			expected: []string{"myAccount3"},
+		},
+		addManagerIndicesTestCase{
+			name: "Template instace",
+			key:  constants.IndexByTemplate,
+			in: &configv1alpha1.TemplateInstance{
+				ObjectMeta: metav1.ObjectMeta{},
+				Spec: configv1alpha1.TemplateInstanceSpec{
+					Template: "test",
+				},
+			},
+			expected: []string{"test"},
 		},
 	}
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	configv1alpha1 "github.com/kiosk-sh/kiosk/pkg/apis/config/v1alpha1"
+	"github.com/kiosk-sh/kiosk/pkg/manager/merge"
 	"github.com/kiosk-sh/kiosk/pkg/util/convert"
 	testingutil "github.com/kiosk-sh/kiosk/pkg/util/testing"
 
@@ -25,6 +26,7 @@ import (
 )
 
 type templateInstanceContollerTest struct {
+	name             string
 	template         *configv1alpha1.Template
 	templateInstance *configv1alpha1.TemplateInstance
 	helmOutput       []runtime.Object
@@ -80,22 +82,26 @@ func TestTemplateInstanceController(t *testing.T) {
 	}
 
 	scheme := testingutil.NewScheme()
-	tests := map[string]*templateInstanceContollerTest{
-		"Simple pod": &templateInstanceContollerTest{
+	tests := []*templateInstanceContollerTest{
+		&templateInstanceContollerTest{
+			name:             "Simple pod",
 			templateInstance: testTemplateInstance.DeepCopy(),
 			template: &configv1alpha1.Template{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
+					Name:            "test",
+					ResourceVersion: "1234",
 				},
 				Resources: configv1alpha1.TemplateResources{
-					Manifests: []runtime.RawExtension{
-						runtime.RawExtension{
-							Raw: []byte(mustConvert(&corev1.Pod{
-								ObjectMeta: metav1.ObjectMeta{
-									Name: "test",
-								},
-								Spec: corev1.PodSpec{},
-							})),
+					Manifests: []configv1alpha1.EmbeddedResource{
+						{
+							RawExtension: runtime.RawExtension{
+								Raw: []byte(mustConvert(&corev1.Pod{
+									ObjectMeta: metav1.ObjectMeta{
+										Name: "test",
+									},
+									Spec: corev1.PodSpec{},
+								})),
+							},
 						},
 					},
 				},
@@ -108,11 +114,13 @@ func TestTemplateInstanceController(t *testing.T) {
 				},
 			},
 		},
-		"Simple helm": &templateInstanceContollerTest{
+		&templateInstanceContollerTest{
+			name:             "Simple helm",
 			templateInstance: testTemplateInstance.DeepCopy(),
 			template: &configv1alpha1.Template{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
+					Name:            "test",
+					ResourceVersion: "1234",
 				},
 				Resources: configv1alpha1.TemplateResources{
 					Helm: &configv1alpha1.HelmConfiguration{
@@ -136,12 +144,14 @@ func TestTemplateInstanceController(t *testing.T) {
 				},
 			},
 		},
-		"Failed": &templateInstanceContollerTest{
+		&templateInstanceContollerTest{
+			name:             "Failed",
 			isFailed:         true,
 			templateInstance: testTemplateInstance.DeepCopy(),
 			template: &configv1alpha1.Template{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
+					Name:            "test",
+					ResourceVersion: "1234",
 				},
 				Resources: configv1alpha1.TemplateResources{
 					Helm: &configv1alpha1.HelmConfiguration{},
@@ -151,18 +161,19 @@ func TestTemplateInstanceController(t *testing.T) {
 		},
 	}
 
-	for testName, test := range tests {
-		fakeClient := testingutil.NewFakeClient(scheme, test.template, test.templateInstance)
+	for _, test := range tests {
+		fakeClient := testingutil.NewFakeClient(scheme, test.template.DeepCopy(), test.templateInstance.DeepCopy())
 		fakeHelmRunner := &fakeHelmRunner{
 			out: test.helmOutput,
 			err: test.helmError,
 		}
 
 		controller := TemplateInstanceReconciler{
-			Client: fakeClient,
-			helm:   fakeHelmRunner,
-			Log:    zap.New(func(o *zap.Options) {}),
-			Scheme: scheme,
+			Client:         fakeClient,
+			helm:           fakeHelmRunner,
+			newMergeClient: func() merge.Interface { return &fakeMerger{client: fakeClient} },
+			Log:            zap.New(func(o *zap.Options) {}),
+			Scheme:         scheme,
 		}
 
 		_, reconcileError := controller.Reconcile(reconcile.Request{NamespacedName: types.NamespacedName{Name: test.templateInstance.Name, Namespace: test.templateInstance.Namespace}})
@@ -171,15 +182,15 @@ func TestTemplateInstanceController(t *testing.T) {
 		}
 
 		// Check if the status is equal
-		err := fakeClient.Get(context.TODO(), types.NamespacedName{Name: test.templateInstance.Name}, test.templateInstance)
+		err := fakeClient.Get(context.TODO(), types.NamespacedName{Name: test.templateInstance.Name, Namespace: test.templateInstance.Namespace}, test.templateInstance)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("Test %s: %v", test.name, err)
 		}
 		if test.isFailed == false && test.templateInstance.Status.Status != configv1alpha1.TemplateInstanceDeploymentStatusDeployed {
-			t.Fatalf("Test %s: unexpected template instance status: %s", testName, test.templateInstance.Status.Status)
+			t.Fatalf("Test %s: unexpected template instance status: %s", test.name, test.templateInstance.Status.Status)
 		}
 		if test.isFailed == true && test.templateInstance.Status.Status != configv1alpha1.TemplateInstanceDeploymentStatusFailed {
-			t.Fatalf("Test %s: expected failed status, but got status %s and error %v", testName, test.templateInstance.Status.Status, reconcileError)
+			t.Fatalf("Test %s: expected failed status, but got status %s and error %v", test.name, test.templateInstance.Status.Status, reconcileError)
 		}
 
 		// Check if the runtime objects exist
@@ -191,10 +202,31 @@ func TestTemplateInstanceController(t *testing.T) {
 
 			err = fakeClient.Get(context.TODO(), types.NamespacedName{Name: obj.Name, Namespace: obj.Namespace}, o)
 			if err != nil {
-				t.Fatalf("Test %s: expected no error retrieving %s/%s, but got %v", testName, obj.Namespace, obj.Name, err)
+				t.Fatalf("Test %s: expected no error retrieving %s/%s, but got %v", test.name, obj.Namespace, obj.Name, err)
 			}
 		}
 	}
+}
+
+type fakeMerger struct {
+	client client.Client
+}
+
+func (f *fakeMerger) Merge(oldManifests, newManifests string, force bool) error {
+	fmt.Println(newManifests)
+	unstructured, err := convert.StringToUnstructuredArray(newManifests)
+	if err != nil {
+		return err
+	}
+
+	for _, u := range unstructured {
+		err = f.client.Create(context.TODO(), u)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 type fakeHelmRunner struct {

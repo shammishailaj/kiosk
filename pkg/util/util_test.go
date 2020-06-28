@@ -1,9 +1,8 @@
 package util
 
 import (
+	"github.com/kiosk-sh/kiosk/pkg/constants"
 	"testing"
-
-	"github.com/kiosk-sh/kiosk/pkg/apis/tenancy"
 
 	"gotest.tools/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -83,7 +82,7 @@ func TestOutput(t *testing.T) {
 type getAccountFromNamespaceTestCase struct {
 	name string
 
-	annotations map[string]string
+	labels map[string]string
 
 	expectedAccount string
 }
@@ -95,8 +94,8 @@ func TestGetAccountFromNamespace(t *testing.T) {
 		},
 		{
 			name: "Get account",
-			annotations: map[string]string{
-				tenancy.SpaceAnnotationAccount: "myAccount",
+			labels: map[string]string{
+				constants.SpaceLabelAccount: "myAccount",
 			},
 			expectedAccount: "myAccount",
 		},
@@ -105,7 +104,7 @@ func TestGetAccountFromNamespace(t *testing.T) {
 	for _, testCase := range testCases {
 		account := GetAccountFromNamespace(&corev1.Namespace{
 			ObjectMeta: v1.ObjectMeta{
-				Annotations: testCase.annotations,
+				Labels: testCase.labels,
 			},
 		})
 		assert.Equal(t, account, testCase.expectedAccount, "Unexpected account in testCase %s", testCase.name)
@@ -128,7 +127,7 @@ func TestIsNamespaceInitializing(t *testing.T) {
 		{
 			name: "It is initializing",
 			annotations: map[string]string{
-				tenancy.SpaceAnnotationInitializing: "true",
+				constants.SpaceAnnotationInitializing: "true",
 			},
 			expected: true,
 		},

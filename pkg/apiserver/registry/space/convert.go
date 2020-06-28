@@ -18,6 +18,7 @@ package space
 
 import (
 	"github.com/kiosk-sh/kiosk/pkg/apis/tenancy"
+	"github.com/kiosk-sh/kiosk/pkg/constants"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -34,11 +35,14 @@ func ConvertSpace(space *tenancy.Space) *corev1.Namespace {
 		},
 	}
 
+	if namespace.Labels == nil {
+		namespace.Labels = map[string]string{}
+	}
 	if namespace.Annotations == nil {
 		namespace.Annotations = map[string]string{}
 	}
 
-	namespace.Annotations[tenancy.SpaceAnnotationAccount] = space.Spec.Account
+	namespace.Labels[constants.SpaceLabelAccount] = space.Spec.Account
 	return namespace
 }
 
@@ -54,11 +58,11 @@ func ConvertNamespace(namespace *corev1.Namespace) *tenancy.Space {
 		},
 	}
 
-	if namespace.Annotations == nil {
-		namespace.Annotations = map[string]string{}
+	if namespace.Labels == nil {
+		namespace.Labels = map[string]string{}
 	}
 
-	space.Spec.Account = namespace.Annotations[tenancy.SpaceAnnotationAccount]
-	delete(space.Annotations, tenancy.SpaceAnnotationAccount)
+	space.Spec.Account = namespace.Labels[constants.SpaceLabelAccount]
+	delete(space.Labels, constants.SpaceLabelAccount)
 	return space
 }
